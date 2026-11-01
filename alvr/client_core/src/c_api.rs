@@ -832,6 +832,7 @@ pub extern "C" fn alvr_render_stream_opengl(
                 // # Safety: the caller provides either null or a valid 2x2 centers array.
                 unsafe { foveation_center_shifts.as_ref() }
                     .map(|centers| centers.map(Vec2::from_array)),
+                None,
             );
         }
     });

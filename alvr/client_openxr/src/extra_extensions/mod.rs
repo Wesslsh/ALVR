@@ -1,5 +1,6 @@
 mod body_tracking_bd;
 mod body_tracking_fb;
+mod environment_depth_meta;
 mod eye_gaze_interaction;
 mod eye_tracking_social;
 mod face_tracking2_fb;
@@ -12,6 +13,7 @@ mod passthrough_htc;
 
 pub use body_tracking_bd::*;
 pub use body_tracking_fb::*;
+pub use environment_depth_meta::*;
 pub use eye_gaze_interaction::*;
 pub use eye_tracking_social::*;
 pub use face_tracking2_fb::*;

@@ -611,6 +611,33 @@ pub struct HsvChromaKeyConfig {
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct DepthMaskConfig {
+    #[schema(strings(
+        help = "Real objects closer than this distance from your eyes are shown through passthrough, everything else shows the game"
+    ))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.2, max = 3.0, step = 0.01)), suffix = "m")]
+    pub distance_threshold: f32,
+
+    #[schema(strings(help = "Width of the soft transition around the distance threshold"))]
+    #[schema(flag = "real-time")]
+    #[schema(gui(slider(min = 0.0, max = 0.5, step = 0.01)), suffix = "m")]
+    pub feathering: f32,
+
+    #[schema(strings(
+        help = "Overlay the headset depth map (dark = near, bright = far, red = passthrough) to check the alignment"
+    ))]
+    #[schema(flag = "real-time")]
+    pub debug_view: bool,
+
+    #[schema(strings(
+        help = "Enable only if the depth map appears upside down in the debug view"
+    ))]
+    #[schema(flag = "real-time")]
+    pub flip_vertical: bool,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[schema(gui = "button_group")]
 pub enum PassthroughMode {
     Blend {
@@ -631,6 +658,12 @@ This is a similar effect to AR glasses."
 
     #[schema(strings(display_name = "HSV Chroma Key"))]
     HsvChromaKey(#[schema(flag = "real-time")] HsvChromaKeyConfig),
+
+    #[schema(strings(
+        display_name = "Depth Mask",
+        help = "Uses the headset depth sensor (Quest 3/3S). Requires the spatial data permission."
+    ))]
+    DepthMask(#[schema(flag = "real-time")] DepthMaskConfig),
 }
 
 #[repr(u8)]
@@ -1687,6 +1720,12 @@ pub fn session_settings_default() -> SettingsDefault {
                         value_start_min: 0.1,
                         value_end_min: 1.0,
                         value_end_max: 1.1,
+                    },
+                    DepthMask: DepthMaskConfigDefault {
+                        distance_threshold: 1.0,
+                        feathering: 0.05,
+                        debug_view: false,
+                        flip_vertical: false,
                     },
                 },
             },

@@ -13,10 +13,12 @@ override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 
 override ENABLE_FFE: bool = false;
 
+const DEPTH_MASK_DEBUG_ALPHA: f32 = 0.6;
+
 struct PushConstant {
     reprojection_transform: mat4x4f,
     view_idx: u32,
-    passthrough_mode: u32, // 0: Blend, 1: RGB chroma key, 2: HSV chroma key
+    passthrough_mode: u32, // 0: Blend, 1: RGB chroma key, 2: HSV chroma key, 3: depth mask
     blend_alpha: f32,
     _align: u32,
     ck_channel0: vec4f,
@@ -40,6 +42,24 @@ struct FoveationUniforms {
     eyes: array<FoveationEyeUniforms, 2>,
 }
 @group(0) @binding(2) var<uniform> foveation: FoveationUniforms;
+
+struct DepthMaskView {
+    // Transforms a point from the stream view space to the environment depth view space
+    input_to_depth: mat4x4f,
+    // Tangents of the FoVs: left, right, down, up
+    input_tangents: vec4f,
+    depth_tangents: vec4f,
+}
+struct DepthMaskUniforms {
+    views: array<DepthMaskView, 2>,
+    // x: distance threshold (m), y: feathering (m), z: depth near plane, w: depth far plane (0 = infinite)
+    params: vec4f,
+    // x: depth data available, y: debug view, z: flip vertical
+    options: vec4f,
+}
+@group(1) @binding(0) var<uniform> depth_mask: DepthMaskUniforms;
+@group(1) @binding(1) var depth_texture: texture_2d_array<f32>;
+@group(1) @binding(2) var depth_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -135,7 +155,21 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     var alpha = pc.blend_alpha; // Default to Blend passthrough mode
-    if pc.passthrough_mode != 0 { // Chroma key
+    if pc.passthrough_mode == 3 { // Depth mask
+        let depth_result = environment_depth_mask(uv);
+        let mask = depth_result.x;
+
+        if depth_mask.options.y > 0.5 {
+            let gray = vec3f(depth_result.y);
+            let debug_color = mix(mix(gray, vec3f(1.0, 0.0, 0.0), 0.5), gray, mask);
+
+            return vec4f(debug_color * DEPTH_MASK_DEBUG_ALPHA, DEPTH_MASK_DEBUG_ALPHA);
+        }
+
+        // Premultiplied alpha, like the chroma key modes
+        color = color * mask;
+        alpha = mask;
+    } else if pc.passthrough_mode != 0 { // Chroma key
         var current = color;
         if pc.passthrough_mode == 2 { // HSV mode
             current = rgb_to_hsv(color);
@@ -148,6 +182,65 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     }
 
     return vec4f(color, alpha);
+}
+
+// Returns x: 1 to show the stream, 0 to show passthrough; y: normalized depth for the debug view.
+// The test checks whether a real surface is closer than the point placed at the threshold distance
+// along the ray of this pixel, so the threshold is a radial distance from the eye.
+fn environment_depth_mask(uv: vec2f) -> vec2f {
+    if depth_mask.options.x < 0.5 {
+        return vec2f(1.0, 0.0);
+    }
+
+    let view = depth_mask.views[pc.view_idx];
+    let distance = depth_mask.params.x;
+    let feathering = max(depth_mask.params.y, 0.001);
+
+    let input_tangents = view.input_tangents;
+    let direction = normalize(vec3f(
+        mix(input_tangents.x, input_tangents.y, uv.x),
+        mix(input_tangents.w, input_tangents.z, uv.y),
+        -1.0,
+    ));
+    let point = view.input_to_depth * vec4f(direction * distance, 1.0);
+    let point_depth = -point.z;
+    if point_depth <= 0.0 {
+        return vec2f(1.0, 0.0);
+    }
+
+    let depth_tangents = view.depth_tangents;
+    var depth_uv = vec2f(
+        (point.x / point_depth - depth_tangents.x) / (depth_tangents.y - depth_tangents.x),
+        (point.y / point_depth - depth_tangents.z) / (depth_tangents.w - depth_tangents.z),
+    );
+    if depth_mask.options.z > 0.5 {
+        depth_uv.y = 1.0 - depth_uv.y;
+    }
+    if any(depth_uv < vec2f(0.0)) || any(depth_uv > vec2f(1.0)) {
+        return vec2f(1.0, 0.0);
+    }
+
+    let raw_depth = textureSampleLevel(depth_texture, depth_sampler, depth_uv, i32(pc.view_idx), 0.0).r;
+    if raw_depth >= 1.0 {
+        return vec2f(1.0, 1.0);
+    }
+
+    let real_depth = linearize_environment_depth(raw_depth);
+    let mask = smoothstep(point_depth - feathering, point_depth + feathering, real_depth);
+
+    return vec2f(mask, clamp(real_depth / (2.0 * distance), 0.0, 1.0));
+}
+
+fn linearize_environment_depth(depth: f32) -> f32 {
+    let ndc = depth * 2.0 - 1.0;
+    let near = depth_mask.params.z;
+    let far = depth_mask.params.w;
+
+    if far <= near { // infinite far plane
+        return 2.0 * near / (1.0 - ndc);
+    }
+
+    return 2.0 * near * far / (far + near - ndc * (far - near));
 }
 
 fn chroma_key_mask(color: vec3f) -> f32 {

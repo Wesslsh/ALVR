@@ -187,6 +187,69 @@ fn create_texture_from_gles(_: &Device, _: u32, _: UVec2, _: TextureFormat) -> T
     unimplemented!()
 }
 
+// Wraps a GL_TEXTURE_2D_ARRAY depth texture owned by the OpenXR runtime (environment depth). The
+// texture is only sampled and it is never deleted by wgpu.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn create_depth_array_texture_from_gles(
+    device: &Device,
+    texture: u32,
+    resolution: UVec2,
+    layers: u32,
+) -> Texture {
+    use std::num::NonZeroU32;
+    use wgpu::{
+        TextureUses,
+        hal::{self, MemoryFlags, api},
+    };
+
+    const FORMAT: TextureFormat = TextureFormat::Depth16Unorm;
+
+    let size = Extent3d {
+        width: resolution.x,
+        height: resolution.y,
+        depth_or_array_layers: layers,
+    };
+
+    unsafe {
+        let hal_texture = device.as_hal::<api::Gles, _, _>(|device| {
+            device.unwrap().texture_from_raw(
+                NonZeroU32::new(texture).unwrap(),
+                &hal::TextureDescriptor {
+                    label: None,
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: FORMAT,
+                    usage: TextureUses::RESOURCE,
+                    memory_flags: MemoryFlags::empty(),
+                    view_formats: vec![],
+                },
+                Some(Box::new(|| ())),
+            )
+        });
+
+        device.create_texture_from_hal::<api::Gles>(
+            hal_texture,
+            &TextureDescriptor {
+                label: Some("environment depth"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: FORMAT,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn create_depth_array_texture_from_gles(_: &Device, _: u32, _: UVec2, _: u32) -> Texture {
+    unimplemented!()
+}
+
 // This is used to convert OpenXR swapchains to wgpu
 pub fn create_gl_swapchain(
     device: &Device,

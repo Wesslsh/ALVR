@@ -3,17 +3,18 @@ use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
-use alvr_session::{PassthroughMode, UpscalingConfig};
+use alvr_session::{DepthMaskConfig, PassthroughMode, UpscalingConfig};
 use std::{cell::Cell, ffi::c_void, iter, mem, rc::Rc};
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
-    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, FragmentState, LoadOp,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology,
-    PushConstantRange, RenderPass, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp,
-    TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
-    include_wgsl,
+    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, Device, Extent3d,
+    FilterMode, FragmentState, LoadOp, PipelineCompilationOptions, PipelineLayoutDescriptor,
+    PrimitiveState, PrimitiveTopology, PushConstantRange, RenderPass, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType,
+    SamplerDescriptor, ShaderStages, StoreOp, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
+    VertexState, include_wgsl,
 };
 
 const FLOAT_SIZE: u32 = mem::size_of::<f32>() as u32;
@@ -36,11 +37,25 @@ const _: () = assert!(
     PUSH_CONSTANTS_SIZE <= MAX_PUSH_CONSTANTS_SIZE,
     "Push constants size exceeds the maximum size"
 );
+const ENVIRONMENT_DEPTH_LAYERS: u32 = 2;
+const DEPTH_MASK_VIEW_FLOAT_COUNT: usize = 16 + 4 + 4;
+const DEPTH_MASK_UNIFORM_FLOAT_COUNT: usize = DEPTH_MASK_VIEW_FLOAT_COUNT * 2 + 4 + 4;
+const DEPTH_MASK_UNIFORM_SIZE: usize = DEPTH_MASK_UNIFORM_FLOAT_COUNT * mem::size_of::<f32>();
 
 pub struct StreamViewParams {
     pub swapchain_index: u32,
     pub input_view_params: ViewParams,
     pub output_view_params: ViewParams,
+}
+
+// Latest depth image acquired from the headset depth sensor. Poses are in the same space as the
+// stream view poses.
+#[derive(Clone, Copy)]
+pub struct EnvironmentDepthFrame {
+    pub swapchain_index: u32,
+    pub near_z: f32,
+    pub far_z: f32,
+    pub views: [ViewParams; 2],
 }
 
 #[derive(Debug)]
@@ -57,6 +72,11 @@ pub struct StreamRenderer {
     foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     foveation_buffer: Buffer,
     last_foveation_center_shifts: Cell<Option<[Vec2; 2]>>,
+    depth_bind_group_layout: BindGroupLayout,
+    depth_uniform_buffer: Buffer,
+    depth_sampler: Sampler,
+    dummy_depth_bind_group: BindGroup,
+    environment_depth_bind_groups: Vec<BindGroup>,
 }
 
 impl StreamRenderer {
@@ -109,6 +129,81 @@ impl StreamRenderer {
                 },
             ],
         });
+
+        let depth_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("stream depth mask"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        // Depth textures can be read as unfilterable float textures
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+
+        let depth_uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("stream depth mask uniforms"),
+            size: DEPTH_MASK_UNIFORM_SIZE as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // A nearest sampler is required: GLES treats depth textures as incomplete when sampled
+        // with linear filtering and no depth comparison.
+        let depth_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("stream depth mask"),
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            mipmap_filter: FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let dummy_depth_texture = device.create_texture(&TextureDescriptor {
+            label: Some("dummy environment depth"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: ENVIRONMENT_DEPTH_LAYERS,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R32Float,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_depth_bind_group = create_depth_bind_group(
+            device,
+            &depth_bind_group_layout,
+            &depth_uniform_buffer,
+            &depth_sampler,
+            &dummy_depth_texture.create_view(&TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::D2Array),
+                ..Default::default()
+            }),
+        );
 
         let shader_module = device.create_shader_module(include_wgsl!("../resources/stream.wgsl"));
 
@@ -170,7 +265,7 @@ impl StreamRenderer {
             // Note: Layout cannot be inferred because of a bug with push constants
             layout: Some(&device.create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &[&bind_group_layout, &depth_bind_group_layout],
                 push_constant_ranges: &[PushConstantRange {
                     stages: ShaderStages::VERTEX_FRAGMENT,
                     range: 0..PUSH_CONSTANTS_SIZE,
@@ -282,6 +377,41 @@ impl StreamRenderer {
             foveated_encoding,
             foveation_buffer,
             last_foveation_center_shifts: Cell::new(None),
+            depth_bind_group_layout,
+            depth_uniform_buffer,
+            depth_sampler,
+            dummy_depth_bind_group,
+            environment_depth_bind_groups: vec![],
+        }
+    }
+
+    /// Imports the environment depth swapchain images (GL_TEXTURE_2D_ARRAY with one layer per
+    /// eye). `None` releases the previous images.
+    pub fn set_environment_depth_swapchain(&mut self, swapchain: Option<(&[u32], UVec2)>) {
+        self.environment_depth_bind_groups.clear();
+
+        if let Some((gl_textures, resolution)) = swapchain {
+            for gl_texture in gl_textures {
+                let texture = super::create_depth_array_texture_from_gles(
+                    &self.context.device,
+                    *gl_texture,
+                    resolution,
+                    ENVIRONMENT_DEPTH_LAYERS,
+                );
+                let view = texture.create_view(&TextureViewDescriptor {
+                    dimension: Some(TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+
+                self.environment_depth_bind_groups
+                    .push(create_depth_bind_group(
+                        &self.context.device,
+                        &self.depth_bind_group_layout,
+                        &self.depth_uniform_buffer,
+                        &self.depth_sampler,
+                        &view,
+                    ));
+            }
         }
     }
 
@@ -295,10 +425,38 @@ impl StreamRenderer {
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
+        environment_depth: Option<&EnvironmentDepthFrame>,
     ) {
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
+        }
+
+        let mut depth_bind_group = &self.dummy_depth_bind_group;
+        if let Some(PassthroughMode::DepthMask(config)) = passthrough {
+            let frame_and_bind_group = environment_depth.and_then(|frame| {
+                self.environment_depth_bind_groups
+                    .get(frame.swapchain_index as usize)
+                    .map(|bind_group| (frame, bind_group))
+            });
+
+            if let Some((_, bind_group)) = frame_and_bind_group {
+                depth_bind_group = bind_group;
+            }
+
+            let uniforms = depth_mask_uniform_data(
+                config,
+                frame_and_bind_group.map(|(frame, _)| frame),
+                [
+                    view_params[0].input_view_params,
+                    view_params[1].input_view_params,
+                ],
+            );
+            self.context.queue.write_buffer(
+                &self.depth_uniform_buffer,
+                0,
+                &depth_mask_uniform_bytes(&uniforms),
+            );
         }
 
         if let Some(config) = &self.foveated_encoding
@@ -388,6 +546,7 @@ impl StreamRenderer {
                 &(view_idx as u32).to_le_bytes(),
             );
             render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
+            render_pass.set_bind_group(1, depth_bind_group, &[]);
             set_passthrough_push_constants(&mut render_pass, passthrough);
             render_pass.draw(0..4, 0..1);
         }
@@ -496,7 +655,115 @@ fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&
                 ),
             );
         }
+        Some(PassthroughMode::DepthMask(_)) => {
+            // Parameters are passed with the depth mask uniform buffer
+            set_u32(render_pass, PASSTHROUGH_MODE_OFFSET, 3);
+            set_float(render_pass, ALPHA_CONST_OFFSET, 1.);
+        }
     }
+}
+
+fn create_depth_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    uniform_buffer: &Buffer,
+    sampler: &Sampler,
+    depth_view: &TextureView,
+) -> BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("stream depth mask"),
+        layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(depth_view),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+fn pose_to_mat4(view: &ViewParams) -> Mat4 {
+    Mat4::from_translation(view.pose.position) * Mat4::from_quat(view.pose.orientation)
+}
+
+fn fov_tangents(view: &ViewParams) -> [f32; 4] {
+    [
+        f32::tan(view.fov.left),
+        f32::tan(view.fov.right),
+        f32::tan(view.fov.down),
+        f32::tan(view.fov.up),
+    ]
+}
+
+// Layout must match DepthMaskUniforms in stream.wgsl
+fn depth_mask_uniform_data(
+    config: &DepthMaskConfig,
+    frame: Option<&EnvironmentDepthFrame>,
+    input_views: [ViewParams; 2],
+) -> [f32; DEPTH_MASK_UNIFORM_FLOAT_COUNT] {
+    let mut data = [0.0; DEPTH_MASK_UNIFORM_FLOAT_COUNT];
+    let (views_data, rest) = data.split_at_mut(DEPTH_MASK_VIEW_FLOAT_COUNT * 2);
+
+    if let Some(frame) = frame {
+        for ((view_data, input_view), depth_view) in views_data
+            .chunks_exact_mut(DEPTH_MASK_VIEW_FLOAT_COUNT)
+            .zip(input_views.iter())
+            .zip(frame.views.iter())
+        {
+            let input_to_depth = pose_to_mat4(depth_view).inverse() * pose_to_mat4(input_view);
+
+            let (matrix, tangents) = view_data.split_at_mut(16);
+            matrix.copy_from_slice(&input_to_depth.to_cols_array());
+            tangents[..4].copy_from_slice(&fov_tangents(input_view));
+            tangents[4..].copy_from_slice(&fov_tangents(depth_view));
+        }
+    }
+
+    let (near_z, far_z) = frame.map_or((0.0, 0.0), |frame| {
+        // A far plane at infinity is encoded as 0
+        let far_z = if frame.far_z.is_finite() {
+            frame.far_z
+        } else {
+            0.0
+        };
+
+        (frame.near_z, far_z)
+    });
+
+    let to_flag = |value: bool| if value { 1.0 } else { 0.0 };
+
+    rest.copy_from_slice(&[
+        config.distance_threshold,
+        config.feathering,
+        near_z,
+        far_z,
+        to_flag(frame.is_some()),
+        to_flag(config.debug_view),
+        to_flag(config.flip_vertical),
+        0.0,
+    ]);
+
+    data
+}
+
+fn depth_mask_uniform_bytes(
+    data: &[f32; DEPTH_MASK_UNIFORM_FLOAT_COUNT],
+) -> [u8; DEPTH_MASK_UNIFORM_SIZE] {
+    let mut bytes = [0; DEPTH_MASK_UNIFORM_SIZE];
+
+    for (chunk, value) in bytes.chunks_exact_mut(mem::size_of::<f32>()).zip(data) {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+
+    bytes
 }
 
 fn foveated_encoding_data(

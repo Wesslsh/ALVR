@@ -1,4 +1,5 @@
 use crate::{
+    extra_extensions::EnvironmentDepthMETA,
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
 };
@@ -12,9 +13,10 @@ use alvr_common::{
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
+    warn,
     parking_lot::RwLock,
 };
-use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
+use alvr_graphics::{EnvironmentDepthFrame, GraphicsContext, StreamRenderer, StreamViewParams};
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
@@ -31,6 +33,7 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+const ENVIRONMENT_DEPTH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -92,6 +95,9 @@ pub struct StreamContext {
     input_thread_running: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
+    environment_depth: Option<EnvironmentDepthMETA>,
+    environment_depth_frame: Option<EnvironmentDepthFrame>,
+    environment_depth_retry_deadline: Instant,
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
@@ -239,6 +245,9 @@ impl StreamContext {
             input_thread_running,
             config,
             target_view_resolution,
+            environment_depth: None,
+            environment_depth_frame: None,
+            environment_depth_retry_deadline: Instant::now(),
             renderer,
             decoder: None,
         };
@@ -336,6 +345,61 @@ impl StreamContext {
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
     }
 
+    // Creates or destroys the depth provider following the passthrough mode, then acquires the
+    // latest depth image. The previous image is kept while no new one is available.
+    fn update_environment_depth(&mut self, display_time: xr::Time) {
+        if !matches!(self.config.passthrough, Some(PassthroughMode::DepthMask(_))) {
+            if let Some(environment_depth) = self.environment_depth.take() {
+                self.renderer.set_environment_depth_swapchain(None);
+                drop(environment_depth);
+            }
+            self.environment_depth_frame = None;
+
+            return;
+        }
+
+        if self.environment_depth.is_none()
+            && Instant::now() >= self.environment_depth_retry_deadline
+        {
+            match EnvironmentDepthMETA::new(&self.xr_session) {
+                Ok(environment_depth) => {
+                    let (width, height) = environment_depth.resolution();
+                    self.renderer.set_environment_depth_swapchain(Some((
+                        environment_depth.swapchain_images(),
+                        UVec2::new(width, height),
+                    )));
+                    self.environment_depth = Some(environment_depth);
+                }
+                Err(e) => {
+                    warn!("Environment depth unavailable: {e}");
+                    self.environment_depth_retry_deadline =
+                        Instant::now() + ENVIRONMENT_DEPTH_RETRY_INTERVAL;
+                }
+            }
+        }
+
+        if let Some(environment_depth) = &self.environment_depth {
+            match environment_depth.acquire_image(&self.stage_reference_space, display_time) {
+                Ok(Some(image)) => {
+                    self.environment_depth_frame = Some(EnvironmentDepthFrame {
+                        swapchain_index: image.swapchain_index,
+                        near_z: image.near_z,
+                        far_z: image.far_z,
+                        views: image.views.map(|(pose, fov)| ViewParams {
+                            pose: crate::from_xr_pose(pose),
+                            fov: crate::from_xr_fov(fov),
+                        }),
+                    });
+                }
+                Ok(None) => (),
+                Err(e) => {
+                    error!("Failed to acquire environment depth image: {e}");
+                    self.environment_depth_frame = None;
+                }
+            }
+        }
+    }
+
     pub fn render(
         &mut self,
         frame_interval: Duration,
@@ -430,6 +494,8 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        self.update_environment_depth(xr_vsync_time);
+
         self.renderer.render(
             buffer_ptr,
             [
@@ -448,6 +514,7 @@ impl StreamContext {
             frame_metadata
                 .foveation_center_shifts
                 .map(|centers| centers.map(Vec2::from_array)),
+            self.environment_depth_frame.as_ref(),
         );
 
         self.swapchains[0].release_image().unwrap();
@@ -510,6 +577,7 @@ impl StreamContext {
                             ..
                         } | PassthroughMode::RgbChromaKey(_)
                             | PassthroughMode::HsvChromaKey(_)
+                            | PassthroughMode::DepthMask(_)
                     ),
                 }),
             clientside_post_processing,
